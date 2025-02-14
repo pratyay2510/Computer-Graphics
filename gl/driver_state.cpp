@@ -16,6 +16,8 @@ driver_state::~driver_state()
     delete [] image_depth;
 }
 
+
+
 // -----------------------------------------------------------------------------
 // initialize_render: Allocate and initialize the render buffers.
 // -----------------------------------------------------------------------------
@@ -36,6 +38,9 @@ void initialize_render(driver_state& state, int width, int height)
     // Initialize the depth buffer to 1.0 (the farthest depth).
     std::fill_n(state.image_depth, width * height, 1.0f);
 }
+
+
+
 
 // -----------------------------------------------------------------------------
 // render: Render the geometry stored in the driver_state.
@@ -190,6 +195,8 @@ void render(driver_state& state, render_type type)
 }
 
 
+
+
 // -----------------------------------------------------------------------------
 // perspective_interpolate: Compute the intersection vertex along an edge crossing a clip plane.
 // -----------------------------------------------------------------------------
@@ -227,30 +234,30 @@ data_geometry perspective_interpolate(const data_geometry& in1, const data_geome
     // Compute the clip–space interpolation factor.
     float t_clip = d1 / (d1 - d2);
 
-    // For noperspective interpolation, compute the interpolation factor in NDC.
+    // For noperspective interpolation, we want a factor that is linear in NDC.
     float t_ndc = t_clip; // Default value.
     {
-        // Compute normalized device coordinates for both vertices.
+        // Compute normalized device coordinates (perform perspective division)
         vec4 ndc1 = in1.gl_Position / in1.gl_Position[3];
         vec4 ndc2 = in2.gl_Position / in2.gl_Position[3];
         switch(face) {
-            case 0: // Near plane: use z coordinate, expected ndc.z >= -1
-                t_ndc = (ndc1[2] - (-1)) / (ndc1[2] - ndc2[2]);
+            case 0: // Near plane: ndc.z >= -1, so the distance from -1 is (ndc + 1)
+                t_ndc = (ndc1[2] + 1.0f) / (ndc1[2] - ndc2[2]);
                 break;
             case 1: // Far plane: ndc.z <= 1
-                t_ndc = (1 - ndc1[2]) / (ndc2[2] - ndc1[2]);
+                t_ndc = (1.0f - ndc1[2]) / (ndc2[2] - ndc1[2]);
                 break;
             case 2: // Left plane: ndc.x >= -1
-                t_ndc = (ndc1[0] - (-1)) / (ndc1[0] - ndc2[0]);
+                t_ndc = (ndc1[0] + 1.0f) / (ndc1[0] - ndc2[0]);
                 break;
             case 3: // Right plane: ndc.x <= 1
-                t_ndc = (1 - ndc1[0]) / (ndc2[0] - ndc1[0]);
+                t_ndc = (1.0f - ndc1[0]) / (ndc2[0] - ndc1[0]);
                 break;
             case 4: // Bottom plane: ndc.y >= -1
-                t_ndc = (ndc1[1] - (-1)) / (ndc1[1] - ndc2[1]);
+                t_ndc = (ndc1[1] + 1.0f) / (ndc1[1] - ndc2[1]);
                 break;
             case 5: // Top plane: ndc.y <= 1
-                t_ndc = (1 - ndc1[1]) / (ndc2[1] - ndc1[1]);
+                t_ndc = (1.0f - ndc1[1]) / (ndc2[1] - ndc1[1]);
                 break;
             default:
                 t_ndc = t_clip;
@@ -260,39 +267,53 @@ data_geometry perspective_interpolate(const data_geometry& in1, const data_geome
 
     // Interpolate the clip–space position using t_clip.
     result.gl_Position = in1.gl_Position * (1 - t_clip) + in2.gl_Position * t_clip;
+
     // Allocate memory for the interpolated attribute data.
     result.data = new float[MAX_FLOATS_PER_VERTEX];
     for (int i = 0; i < MAX_FLOATS_PER_VERTEX; i++) {
         switch(interp_rules[i]) {
             case interp_type::flat:
-                // For flat interpolation, always use the attribute from the provoking vertex.
-                // (In our implementation the provoking vertex is the first vertex of the original triangle.)
+                // Flat: use the provoking vertex attribute.
                 result.data[i] = in1.data[i];
                 break;
             case interp_type::noperspective:
-                // Noperspective interpolation: use the NDC–based interpolation factor.
+                // Noperspective: use the interpolation factor computed in NDC.
                 result.data[i] = in1.data[i] * (1 - t_ndc) + in2.data[i] * t_ndc;
                 break;
             case interp_type::smooth:
-                {
-                    // Perspective–correct (smooth) interpolation.
-                    float w1 = in1.gl_Position[3];
-                    float w2 = in2.gl_Position[3];
-                    float attr1 = in1.data[i] / w1;
-                    float attr2 = in2.data[i] / w2;
-                    float interp_a = attr1 * (1 - t_clip) + attr2 * t_clip;
-                    float recip_w = (1 - t_clip) / w1 + t_clip / w2;
-                    result.data[i] = interp_a / recip_w;
-                }
+            {
+                // Perspective-correct interpolation.
+                // t_clip is our interpolation factor.
+                float t = t_clip;
+                
+                // Retrieve the w components from the vertices.
+                float w1 = in1.gl_Position[3];
+                float w2 = in2.gl_Position[3];
+                
+                // Compute the "linearized" attribute values (attribute divided by w).
+                float a1 = in1.data[i] / w1;
+                float a2 = in2.data[i] / w2;
+                
+                // Interpolate the linearized attribute values.
+                float interpolated_a = a1 * (1 - t) + a2 * t;
+                
+                // Interpolate the reciprocals of the w components.
+                float interpolated_reciprocal_w = (1 - t) / w1 + t / w2;
+                
+                // Recover the perspective-correct attribute by dividing.
+                result.data[i] = interpolated_a / interpolated_reciprocal_w;
+            }
                 break;
             default:
-                // Default to linear interpolation.
                 result.data[i] = in1.data[i] * (1 - t_clip) + in2.data[i] * t_clip;
                 break;
         }
     }
     return result;
 }
+
+
+
 
 
 // -----------------------------------------------------------------------------
@@ -371,8 +392,8 @@ void clip_triangle(driver_state& state, const data_geometry& v0,
         // We triangulate it into two triangles:
         //    Triangle 1: (inside[0], inside[1], i1)
         //    Triangle 2: (inside[0], i1, i0)
-        clip_triangle(state, inside[0], inside[1], i1, face + 1);
-        clip_triangle(state, inside[0], i1, i0, face + 1);
+        clip_triangle(state, inside[0], inside[1], i0, face + 1);
+        clip_triangle(state, inside[1], i1, i0, face + 1);
     }
     else if (inside.size() == 1 && outside.size() == 2) {
         // ONE VERTEX INSIDE; compute intersections with both outside vertices.
@@ -400,16 +421,25 @@ data_geometry interpolate(const data_geometry& a, const data_geometry& b, float 
     return result;
 }
 
+
+
+
 // -----------------------------------------------------------------------------
-// to_screen_space: Convert clip-space coordinates to screen-space by performing perspective division.
+// to_screen_space: Convert clip-space coordinates to screen-space by performing
+// perspective division. (Modified for clarity to emphasize the perspective division.)
 // -----------------------------------------------------------------------------
-vec3 to_screen_space(const vec4& ndc, int width, int height) {
+vec3 to_screen_space(const vec4& clip, int width, int height) {
+    // Perform perspective division to get normalized device coordinates.
+    vec4 ndc = clip / clip[3];
     return vec3(
-        (ndc[0] / ndc[3] * 0.5f + 0.5f) * width,
-        (ndc[1] / ndc[3] * 0.5f + 0.5f) * height,
-        ndc[2] / ndc[3]
+        (ndc[0] * 0.5f + 0.5f) * width,
+        (ndc[1] * 0.5f + 0.5f) * height,
+        ndc[2]
     );
 }
+
+
+
 
 // -----------------------------------------------------------------------------
 // compute_barycentric: Compute barycentric coordinates for point P relative to triangle ABC.
@@ -428,61 +458,133 @@ vec3 compute_barycentric(const vec3& A, const vec3& B, const vec3& C, const vec3
     return vec3(u, v, w);
 }
 
+
+
+
+
+
 // -----------------------------------------------------------------------------
-// rasterize_triangle: Rasterize a triangle defined by three geometry vertices.
+/**
+ * Rasterizes a triangle onto the image buffer using barycentric interpolation.
+ *
+ * This function takes three vertices of a triangle in clip space and converts them to 
+ * screen-space coordinates. It then determines the triangle's bounding box in pixel space 
+ * and iterates over each pixel within that bounding box. Using barycentric coordinates, 
+ * it determines whether a pixel is inside the triangle, and if so, performs depth testing 
+ * and interpolates vertex attributes for shading.
+ *
+ * @param state Reference to the driver state, which contains image buffers, depth buffers, 
+ *              shader functions, and rendering parameters.
+ * @param v0 First vertex of the triangle in clip space.
+ * @param v1 Second vertex of the triangle in clip space.
+ * @param v2 Third vertex of the triangle in clip space.
+ *
+ * @details
+ * 1. **Clip-space to Screen-space Conversion**:
+ *    - The vertex positions are converted to normalized device coordinates (NDC).
+ *    - NDC values are mapped to screen-space coordinates.
+ *
+ * 2. **Bounding Box Calculation**:
+ *    - The axis-aligned bounding box (AABB) is computed for the triangle.
+ *    - The box is clamped to fit within the screen dimensions.
+ *
+ * 3. **Rasterization and Barycentric Interpolation**:
+ *    - Each pixel within the bounding box is tested using barycentric coordinates.
+ *    - If the pixel is inside the triangle, its depth is computed.
+ *    - A depth test is performed to check visibility.
+ *    - Vertex attributes (such as color, texture coordinates, and normals) are interpolated.
+ *    - Perspective-correct interpolation is applied if required.
+ *
+ * 4. **Fragment Processing**:
+ *    - The interpolated attributes are passed to the fragment shader.
+ *    - The fragment shader computes the final color.
+ *    - The color is converted to an 8-bit format and written to the image buffer.
+ *
+ * 5. **Memory Management**:
+ *    - Dynamically allocated memory for fragment attributes is freed after use.
+ *
+ * @note
+ * - Uses **perspective-correct interpolation** to ensure proper depth and attribute mapping.
+ * - Implements a **depth buffer (Z-buffer)** to handle occlusion.
+ * - Assumes the presence of a **fragment shader** to determine final pixel colors.
+ * - Works efficiently by iterating only within the triangle’s bounding box.
+ */
 // -----------------------------------------------------------------------------
 void rasterize_triangle(driver_state& state, const data_geometry& v0,
                         const data_geometry& v1, const data_geometry& v2)
 {
+    // Convert clip-space positions to screen-space coordinates.
     auto ndc_to_screen = [&](const vec4& v) -> vec3 {
         return to_screen_space(v, state.image_width, state.image_height);
     };
     vec3 p0 = ndc_to_screen(v0.gl_Position);
     vec3 p1 = ndc_to_screen(v1.gl_Position);
     vec3 p2 = ndc_to_screen(v2.gl_Position);
+
+    // Compute the bounding box of the triangle.
     int min_x = std::max(0, (int)std::min({p0[0], p1[0], p2[0]}));
     int max_x = std::min(state.image_width - 1, (int)std::max({p0[0], p1[0], p2[0]}));
     int min_y = std::max(0, (int)std::min({p0[1], p1[1], p2[1]}));
     int max_y = std::min(state.image_height - 1, (int)std::max({p0[1], p1[1], p2[1]}));
-    auto edge_function = [](const vec3& a, const vec3& b, const vec3& c) -> float {
-        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
-    };
-    float area = edge_function(p0, p1, p2);
-    if (area == 0) return;
+
+    // Loop over each pixel in the bounding box.
     for (int y = min_y; y <= max_y; y++) {
         for (int x = min_x; x <= max_x; x++) {
+            // Sample at the pixel center.
             vec3 p(x + 0.5f, y + 0.5f, 0);
-            float w0 = edge_function(p1, p2, p) / area;
-            float w1 = edge_function(p2, p0, p) / area;
-            float w2 = edge_function(p0, p1, p) / area;
-            if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
+
+            // Compute barycentric coordinates using the provided function.
+            // 'bary' holds (u, v, w) corresponding to vertices p0, p1, and p2.
+            vec3 bary = compute_barycentric(p0, p1, p2, p);
+
+            // A pixel is inside the triangle if all barycentric weights are nonnegative.
+            if (bary[0] >= 0 && bary[1] >= 0 && bary[2] >= 0) {
                 int pixel_index = y * state.image_width + x;
+
+                // Compute depth via interpolation.
                 float z0 = v0.gl_Position[2] / v0.gl_Position[3];
                 float z1 = v1.gl_Position[2] / v1.gl_Position[3];
                 float z2 = v2.gl_Position[2] / v2.gl_Position[3];
-                float depth = w0 * z0 + w1 * z1 + w2 * z2;
+                float depth = bary[0] * z0 + bary[1] * z1 + bary[2] * z2;
+
+                // Depth test: only update if the new depth is closer.
                 if (depth < state.image_depth[pixel_index]) {
                     state.image_depth[pixel_index] = depth;
+
+                    // Prepare the fragment with interpolated vertex attributes.
                     data_fragment fragment;
                     fragment.data = new float[state.floats_per_vertex];
                     for (int i = 0; i < state.floats_per_vertex; i++) {
                         if (state.interp_rules[i] == interp_type::smooth) {
-                            float w_div_z = w0 / v0.gl_Position[3] + w1 / v1.gl_Position[3] + w2 / v2.gl_Position[3];
-                            fragment.data[i] = (w0 * v0.data[i] / v0.gl_Position[3] +
-                                                w1 * v1.data[i] / v1.gl_Position[3] +
-                                                w2 * v2.data[i] / v2.gl_Position[3]) / w_div_z;
+                            // Perspective-correct interpolation.
+                            float w_div_z = bary[0] / v0.gl_Position[3] +
+                                            bary[1] / v1.gl_Position[3] +
+                                            bary[2] / v2.gl_Position[3];
+                            fragment.data[i] = (bary[0] * v0.data[i] / v0.gl_Position[3] +
+                                                bary[1] * v1.data[i] / v1.gl_Position[3] +
+                                                bary[2] * v2.data[i] / v2.gl_Position[3]) / w_div_z;
                         } else if (state.interp_rules[i] == interp_type::noperspective) {
-                            fragment.data[i] = w0 * v0.data[i] + w1 * v1.data[i] + w2 * v2.data[i];
+                            // Linear interpolation in screen space.
+                            fragment.data[i] = bary[0] * v0.data[i] +
+                                               bary[1] * v1.data[i] +
+                                               bary[2] * v2.data[i];
                         } else if (state.interp_rules[i] == interp_type::flat) {
+                            // Flat interpolation: simply use the attribute from v0.
                             fragment.data[i] = v0.data[i];
                         }
                     }
+
+                    // Run the fragment shader to determine the final color.
                     data_output output;
                     state.fragment_shader(fragment, output, state.uniform_data);
+
+                    // Convert the output color to a pixel format.
                     int r = std::min(255, static_cast<int>(output.output_color[0] * 255));
                     int g = std::min(255, static_cast<int>(output.output_color[1] * 255));
                     int b = std::min(255, static_cast<int>(output.output_color[2] * 255));
                     state.image_color[pixel_index] = make_pixel(r, g, b);
+
+                    // Clean up allocated memory.
                     delete[] fragment.data;
                 }
             }
